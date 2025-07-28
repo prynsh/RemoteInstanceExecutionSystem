@@ -5,7 +5,12 @@
   "main": "index.js",
   "scripts": {
     "build": "tsc -b",
-    "dev": "npm run build && node dist/index.js"
+    "dev": "concurrently --names \"SERVER,WORKER\" --prefix-colors \"blue,green\" \"npm run dev:server\" \"npm run dev:worker\"",
+    "dev:server": "tsc -b && node dist/index.js",
+    "dev:worker": "tsc -b && node dist/worker.js",
+    "start": "npm run build && npm run dev",
+    "start:server": "node dist/index.js",
+    "start:worker": "node dist/worker.js"
   },
   "keywords": [],
   "author": "",
@@ -17,7 +22,9 @@
     "@types/express": "^5.0.3",
     "cors": "^2.8.5",
     "express": "^5.1.0",
+    "redis": "^5.6.1",
     "socket.io": "^4.8.1",
-    "uuid": "^11.1.0"
+    "uuid": "^11.1.0",
+    "zod": "^4.0.10"
   }
 }

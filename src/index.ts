@@ -1,108 +1,170 @@
 import express from 'express';
-import { spawn } from 'child_process';
 import { v4 as uuidv4 } from 'uuid';
 import cors from 'cors';
-import http from 'http';
-import { Server } from 'socket.io';
 import { PrismaClient } from '../generated/prisma';
+import { redisClient } from './redis';
+import { z } from 'zod';
 
 const app = express();
-const server = http.createServer(app);
-const io = new Server(server, {
-  cors: {
-    origin: '*'
-  }
-});
-
 const prisma = new PrismaClient();
-app.use(express.json());
+
+const createJobSchema = z.object({
+  command: z.string().min(1).max(100),
+  args: z.array(z.string()).default([]),
+  priority: z.enum(['low', 'medium', 'high']).default('medium'),
+  timeout: z.number().min(1).max(3600).default(60)
+});
+
+const ALLOWED_COMMANDS = ['echo', 'ls', 'pwd', 'date', 'sleep','node','cat'];
+
 app.use(cors());
+app.use(express.json())
+const asyncHandler = (fn: Function) => (req: any, res: any, next: any) => {
+  Promise.resolve(fn(req, res, next)).catch(next);
+};
 
-const jobs = new Map();
+app.post('/api/jobs', asyncHandler(async (req: any, res: any) => {
+  try {
+    const { command, args, priority, timeout } = createJobSchema.parse(req.body);
+    
+    if (!ALLOWED_COMMANDS.includes(command)) {
+      return res.status(400).json({ 
+        error: 'Command not allowed',
+        allowedCommands: ALLOWED_COMMANDS 
+      });
+    }
 
-app.post('/api/jobs', async (req, res) => {
-  const { command, args = [], priority = 'medium', timeout = 60 } = req.body;
-  const id = uuidv4();
-
-  const job = await prisma.job.create({
-    data: {
-      id,
-      command,
-      parameters: args,
-      priority,
-      timeout,
-      status: 'queued',
-    },
-  });
-
-  runJob(job);
-
-  res.json({ jobId: id });
-});
-
-app.post('/api/jobs/:id/cancel', async (req, res) => {
-  const jobId = req.params.id;
-  const record = jobs.get(jobId);
-  if (record) {
-    record.process.kill();
-    clearTimeout(record.timeout);
-    await prisma.job.update({ where: { id: jobId }, data: { status: 'cancelled' } });
-    jobs.delete(jobId);
-    res.json({ success: true });
-  } else {
-    res.status(404).json({ error: 'Job not running or already completed' });
-  }
-});
-
-app.get('/api/jobs', async (_req, res) => {
-  const allJobs = await prisma.job.findMany({ orderBy: { createdAt: 'desc' } });
-  res.json(allJobs);
-});
-
-app.get('/api/jobs/:id/logs', async (req, res) => {
-  const logs = await prisma.jobLog.findMany({
-    where: { jobId: req.params.id },
-    orderBy: { timestamp: 'asc' }
-  });
-  res.json(logs);
-});
-
-async function runJob(job:any) {
-  await prisma.job.update({ where: { id: job.id }, data: { status: 'running', startedAt: new Date() } });
-
-  const child = spawn(job.command, job.parameters);
-
-  const timeout = setTimeout(() => {
-    child.kill();
-  }, job.timeout * 1000);
-
-  jobs.set(job.id, { process: child, timeout });
-
-  child.stdout.on('data', async (data) => {
-    const message = data.toString();
-    io.emit(`log:${job.id}`, message);
-    await prisma.jobLog.create({ data: { jobId: job.id, message } });
-  });
-
-  child.stderr.on('data', async (data) => {
-    const message = data.toString();
-    io.emit(`log:${job.id}`, message);
-    await prisma.jobLog.create({ data: { jobId: job.id, message } });
-  });
-
-  child.on('close', async (code) => {
-    clearTimeout(timeout);
-    jobs.delete(job.id);
-    await prisma.job.update({
-      where: { id: job.id },
+    const id = uuidv4();
+    
+    const job = await prisma.job.create({
       data: {
-        status: code === 0 ? 'completed' : 'failed',
-        completedAt: new Date(),
-        exitCode: code,
+        id,
+        command,
+        parameters: args,
+        priority,
+        timeout,
+        status: 'queued',
       },
     });
-  });
-}
 
-server.listen(4000, () => console.log('Server running on http://localhost:4000'))
+    const queueKey = `jobQueue:${priority}`;
+    await redisClient.lPush(queueKey, JSON.stringify(job));
+    
+    res.json({ jobId: id, status: 'queued' });
+  } catch (error) {
+    if (error instanceof z.ZodError) {
+      return res.status(400).json({ error: 'Invalid input' });
+    }
+    console.error('Error creating job:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}));
 
+app.delete('/api/jobs/:id', asyncHandler(async (req: any, res: any) => {
+  try {
+    const jobId = req.params.id;
+    
+    if (!jobId || typeof jobId !== 'string') {
+      return res.status(400).json({ error: 'Invalid job ID' });
+    }
+
+    const job = await prisma.job.findUnique({ where: { id: jobId } });
+    if (!job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    if (['completed', 'failed', 'cancelled'].includes(job.status)) {
+      return res.status(400).json({ error: 'Job cannot be cancelled' });
+    }
+
+    await Promise.all([
+      redisClient.set(`cancel:${jobId}`, '1', { EX: 3600 }),
+      prisma.job.update({
+        where: { id: jobId },
+        data: { status: 'cancelled' }
+      })
+    ]);
+
+    res.json({ success: true, message: 'Cancellation requested' });
+  } catch (error) {
+    console.error('Error cancelling job:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}));
+
+app.get('/api/jobs', asyncHandler(async (req: any, res: any) => {
+  try {
+    const page = parseInt(req.query.page) || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 20, 100);
+    const offset = (page - 1) * limit;
+
+    const [jobs, total] = await Promise.all([
+      prisma.job.findMany({ 
+        orderBy: { createdAt: 'desc' },
+        skip: offset,
+        take: limit
+      }),
+      prisma.job.count()
+    ]);
+
+    res.json({
+      jobs,
+      pagination: {
+        page,
+        limit,
+        total,
+        pages: Math.ceil(total / limit)
+      }
+    });
+  } catch (error) {
+    console.error('Error fetching jobs:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}));
+
+app.get('/api/jobs/:id', asyncHandler(async (req: any, res: any) => {
+  try {
+    const job = await prisma.job.findUnique({
+      where: { id: req.params.id }
+    });
+
+    if (!job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    res.json(job);
+  } catch (error) {
+    console.error('Error fetching job:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}));
+
+app.get('/api/jobs/:id/logs', asyncHandler(async (req: any, res: any) => {
+  try {
+    const logs = await prisma.jobLog.findMany({
+      where: { jobId: req.params.id },
+      orderBy: { timestamp: 'asc' },
+    });
+    res.json(logs);
+  } catch (error) {
+    console.error('Error fetching logs:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+}));
+
+app.use((error: any, req: any, res: any, next: any) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({ error: 'Internal server error' });
+});
+
+const PORT = process.env.PORT || 4000;
+app.listen(PORT, () => {
+  console.log(`API server running on http://localhost:${PORT}`);
+});
+
+process.on('SIGTERM', async () => {
+  console.log('Shutting down gracefully...');
+  await prisma.$disconnect();
+  await redisClient.quit();
+  process.exit(0);
+});

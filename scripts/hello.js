@@ -1,2 +1,1 @@
-console.log("Hello from Node.js script");
-setTimeout(() => console.log("Done"), 2000);
+setTimeout(() => console.log("Done"), 10000);
